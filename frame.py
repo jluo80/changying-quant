@@ -1,224 +1,221 @@
-# 导入函数库
 from jqdata import *
-from jqfactor import Factor, calc_factors
-import datetime
 import numpy as np
+import talib
+# import datetime
+from numpy import mean
+import traceback
+import pandas as pd
 
-'''
-基于传统财务指标的全A股价值投资策略
-从全A股中选取营业收入同比增长率超过30%的股票
-市净率小于4
-动态市盈率小于30
-市销率小于1
-每个月调整一次仓位，筛选出5只股票
-'''
-
-# 初始化函数，设定基准等等
 def initialize(context):
-    # 设定沪深300作为基准
-    set_benchmark('000300.XSHG')
-    # 设定初始参数
     set_para()
-    # 设定
-    settings()
-    # 开启动态复权模式(真实价格)
-    set_option('use_real_price', True)
-    # 输出内容到日志 log.info()
-    log.info('初始函数开始运行且全局只运行一次')
+    settings(context)
+    get_all_price(context)
 
-    ## 运行函数（reference_security为运行时间的参考标的；传入的标的只做种类区分，因此传入'000300.XSHG'或'510300.XSHG'是一样的）
-      # 开盘前运行
-    run_monthly(before_market_open, monthday=1, time="before_open", reference_security="000300.XSHG")
-      # 开盘时运行
-    run_daily(stop, time="open")
-    run_monthly(market_open, monthday=1, time="open", reference_security="000300.XSHG")
-      # 收盘后运行
-    run_monthly(after_market_close, monthday=1, time="after_close", reference_security="000300.XSHG")
+def before_trading_start(context):
+    timer(context)
+    trends_decision_signal(context)
+    peg(context)
+    blacklist(context)
 
+def handle_data(context, data):
+    if trends_decision_signal(context) == False:
+        if len(g.inx) == 1 and g.inx[0] == '000012.XSHG':
+            pass
+        else:
+            for security in g.inx:
+                order_target_value(security, 0)
+            order_target_value('000012.XSHG', context.portfolio.total_value)
+            print('Trends signal is false')
+    elif trends_decision_signal(context) == True:
+        if context.portfolio.positions['000012.XSHG'].closeable_amount > 0:
+            order_target_value('000012.XSHG',0)
+        print('Trends signal is True')
+
+        stop(context)
+        peg_ex(context)
+    l = context.portfolio.positions.keys()
+    log.info(l)
+
+#setting parameters
 def set_para():
-    g.num_of_holding_stock = 5
-    g.lose_rate = 0.92 
-    g.gain_rate = 2
+    set_benchmark('000300.XSHG')
+    g.lose = 0.95 
+    g.gain = 2
+    g.i = 14
     g.blocking_days = 0
-    g.lock_up_period = 10
+    g.number = 50
+    g.ornum = 10
+    g.days = 30
+    g.current_price = 0
+    g.MA = 0
+    g.inx = 0
 
-def settings():
-    # 过滤掉order系列API产生的比error级别低的log
-    log.set_level('order', 'error')
-
-    ### 股票相关设定 ###
-    # 股票类每笔交易时的手续费是：买入时佣金万分之三，卖出时佣金万分之三加千分之一印花税, 每笔交易佣金最低扣5块钱
-    # set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003, close_commission=0.0003, min_commission=5), type='stock')
-    
+#交易开始钱手续费滑点设置函数设置函数
+def settings(context):
     #将滑点和交易手续费设为0
+    log.set_level('order', 'error')
     set_slippage(FixedSlippage(0))
-    set_order_cost(OrderCost(close_tax=0, open_commission=0, close_commission=0, min_commission=0), type='stock')
-    g.highest_price = {}
-    g.black_list = {}
+    set_order_cost(OrderCost(open_tax = 0, close_tax = 0, open_commission = 0, close_commission = 0, min_commission = 0), type='stock')
+    g.hp = {}
+    g.b_l = {}
+    g.list3 =[]
+    
+#取所有股票成交价格：
+def get_all_price(context):
+    index1 = get_index_stocks('000001.XSHG')
+    index2 = get_index_stocks('399001.XSHE')
+    index =index1+index2
+    log.info(len(index))
+    for security in index:
+        g.hp[security] = attribute_history(security, 1, '1d', 'close',df = False)['close'][-1]
+        
+#timer
+def timer(context):
+    g.i+=1
+    
+#判断清仓函数
+def trends_decision_signal(context):    
+    close_data1 = attribute_history('000001.XSHG', g.days , '1d', ['close'])
+    close_data2 = attribute_history('399001.XSHE', g.days , '1d', ['close'])
+    # 取得过n天的平均价格
+    g.MA = 0.5*(close_data1['close'].mean()+close_data2['close'].mean())
+    # 取得上一时间点价格
+    g.current_price = 0.5*(close_data1['close'][-1]+close_data2['close'][-1])
+    # 取得现有仓位中的所有股票
+    g.inx = list(context.portfolio.positions.keys())
+    if g.current_price < g.MA:
+        g.i = 0
+        return False
+    elif g.i >= g.blocking_days:
+        return True
+    else:
+        pass
+        
+#止损策略 如果价格低于三十天平均价 清仓
+def decision_ex(context):
+    if trends_decision_signal(context)==0:
+        for security in g.inx:
+            order_target_value(security, 0)
+        order_target_value('000012.XSHG', context.portfolio.total_value)
+    if trends_decision_signal(context):
+        order_target_value('000012.XSHG',0)
+        stop(context)
+        peg_ex(context)
+   
+#止盈止损与黑名单
+def stop(context):
+    s = context.portfolio.positions.keys()
+    list4 = list(s)
+    price = history(1,'1m', 'close', security_list=list4)
+    for security in list4:
+        price_now = price[security][-1]
+        price_ji = context.portfolio.positions[security].avg_cost
+        if security not in g.hp.keys():
+            g.hp[security] = price_now
+        elif price_now >= g.hp[security]:
+            g.hp[security] = price_now
+        elif price_now < g.lose*g.hp[security] or price_now > g.gain*price_ji:
+            g.b_l[security] = 0
+            order_target_value(security, 0)
+        else:
+            pass
 
-'''
-================================================================================
-每天开盘前
-================================================================================
-'''
-def before_market_open(context):
-    # 输出运行时间
-    log.info('函数运行时间(before_market_open)：'+str(context.current_dt.time()))
+#黑名单剔除
+def blacklist(context):
+    list_q = list(g.b_l.keys())
+    for security in list_q:
+        g.b_l[security]+= 1
+        if g.b_l[security] > g.ornum:
+            del g.b_l[security]
 
-    # 给微信发送消息（添加模拟交易，并绑定微信生效）
-    # send_message('美好的一天~')
-
-    # 获取2019-01-01还在上市的全部股票 
-    # stocks = list(get_all_securities(types=['stock'], date="2019-01-01").index)
-    #取沪深300中的股票为备选股
-    SH_INDEX = get_index_stocks('000001.XSHG')
-    SZ_INDEX = get_index_stocks('399001.XSHE')
-    g.basket = SH_INDEX + SZ_INDEX
-
-    # 0.获取营业收入同比增长率超过growth_threshold的股票
-    growth_threshold = 0.3
-    sub_basket_0 = get_inc_total_revenue_year_on_year(context, g.basket, growth_threshold)
-    
-    # 1.获取市净率小于pb_threshold的股票
-    pb_threshold = 4.0
-    sub_basket_1 = get_pb_ratio(context, g.basket, pb_threshold)
-
-    # 2.获取动态市盈率小于pe_threshold的股票
-    pe_threshold = 30.0
-    sub_basket_2 = get_pe_ratio(context, g.basket, pe_threshold)
-    
-    # 3.获取市销率小于ps_threshold的股票
-    ps_threshold = 1.0
-    sub_basket_3 = get_ps_ratio(context, g.basket, ps_threshold)
-    
-    g.sub_basket = list(set(sub_basket_0) & set(sub_basket_1) & set(sub_basket_2) & set(sub_basket_3))
-
-    stop(context)
-    delete_from_blacklist(context)
-
-'''
-================================================================================
-每天开盘时 
-================================================================================
-'''
-def market_open(context):
-    log.info('函数运行时间(market_open):' + str(context.current_dt.time()))
-    g.sub_basket = filter_st_stock(g.sub_basket)
-    num = len(g.sub_basket)      
-
-    if num != 0:
-        for stock in g.sub_basket[:g.num_of_holding_stock]:
-            order_target_value(stock, 0)
-    # 取得当前的现金
-    cash = context.portfolio.available_cash
-    for stock in g.sub_basket[:g.num_of_holding_stock]:
-        order_value(stock, cash / g.num_of_holding_stock) 
-
-            
-'''
-================================================================================
-每天开盘后
-================================================================================
-'''
-def after_market_close(context):
-    log.info(str('函数运行时间(after_market_close):'+str(context.current_dt.time())))
-    #得到当天所有成交记录
-    trades = get_trades()
-    for _trade in trades.values():
-        log.info('成交记录：'+str(_trade))
-    log.info('一天结束')
-    log.info('##############################################################')
-    
-'''
-================================================================================
-筛选股票条件函数
-================================================================================
-'''
-def get_inc_total_revenue_year_on_year(context, basket, growth_threshold):
-    log.info(str("获取营业收入同比增长率超过" + str(growth_threshold) + "的股票 "))
-    
-    #取出个股的营业收入同比增长率
-    q = query(indicator.inc_total_revenue_year_on_year, indicator.code).filter(indicator.code.in_(basket))                            
-    
-    df = get_fundamentals(q)
-    
-    return list(df.loc[df["inc_total_revenue_year_on_year"] > growth_threshold]["code"])
-
-def get_pb_ratio(context, basket, pb_threshold):
-    log.info(str("获取市净率小于" + str(pb_threshold) + "的股票 "))
-    
-    # 取出个股的市净率
-    q = query(valuation.pb_ratio, valuation.code).filter(valuation.code.in_(basket))                            
-    
-    df = get_fundamentals(q)
-    
-    return list(df.loc[(df["pb_ratio"] < pb_threshold) & (df["pb_ratio"] > 0.0)]["code"])
-
-def get_pe_ratio(context, basket, pe_threshold):
-    log.info(str("获取动态市盈率小于" + str(pe_threshold) + "的股票 "))
-    
-    # 取出个股的动态市盈率
-    q = query(valuation.pe_ratio, valuation.code).filter(valuation.code.in_(basket))                            
-    
-    df = get_fundamentals(q)
-    
-    return(list(df.loc[(df["pe_ratio"] < pe_threshold) & (df["pe_ratio"] > 0.0)]["code"]))
-    
-def get_ps_ratio(context, basket, ps_threshold):
-    log.info(str("获取市销率小于" + str(ps_threshold) + "的股票 "))
-    
-    # 取出个股的市销率
-    q = query(valuation.ps_ratio, valuation.code).filter(valuation.code.in_(basket))                            
-    
-    df = get_fundamentals(q)
-    
-    return(list(df.loc[(df["ps_ratio"] < ps_threshold) & (df["ps_ratio"] >0.0)]["code"]))
-    
-'''
-================================================================================
-选股预处理 
-================================================================================
-'''
 #剔除停牌和ST股
 def filter_st_stock(stock_list):
     current_data = get_current_data()
     return [stock for stock in stock_list if not current_data[stock].paused and not current_data[stock].is_st]
 
-'''
-================================================================================
-风控措施  
-================================================================================
-'''
-#止盈止损与黑名单
-def stop(context):
-    stock_list = list(context.portfolio.positions.keys())
-    price = history(1,'1m', 'close', security_list=stock_list)
-    for security in stock_list:
-        price_now = price[security][-1]
-        price_pre = context.portfolio.positions[security].avg_cost
-        if security not in g.highest_price.keys():
-            g.highest_price[security] = price_now # 该股票股价的首次跟踪记录
-        elif price_now >= g.highest_price[security]:
-            g.highest_price[security] = price_now # 该股票股价屡创新高
-            # 从历史最高位下跌幅度超过预期 或 比上一个交易日上涨幅度超过预期
-        elif price_now < g.lose_rate*g.highest_price[security] or price_now > g.gain_rate*price_pre: 
-            g.black_list[security] = 0
-            order_target_value(security, 0)
+#获取备选股票
+def peg(context):
+     #取沪深300中的股票为备选股
+    list0 = get_index_stocks('000001.XSHG')
+    list2 = get_index_stocks('399001.XSHE')
+    list1 =list0 +list2
+     #取出个股的净收益 总股数 和市盈率
+    q1 = query(indicator.inc_net_profit_to_shareholders_year_on_year,
+            income.code
+                        ).filter(income.code.in_(list1)
+                        )
+    q2 = query(indicator.inc_revenue_year_on_year,
+            valuation.code
+                    ).filter(income.code.in_(list1)
+                    )
+    q3 = query(valuation.pe_ratio,
+              valuation.code).filter(balance.code.in_(list1))                            
+    a = pro_g = get_fundamentals(q1)
+    b = reve_g = get_fundamentals(q2)
+    
+    # c = cap_cy = get_fundamentals(q2, date = str(ct_d))
+    # d = cap_py = get_fundamentals(q2, statDate = str(py_y))
+    
+    c = pe_ratio = get_fundamentals(q3)
+    
+    a.index, b.index ,c.index = a['code'], b['code'],c['code']
+    #取出所有盈利备选股
+    a = a[a['inc_net_profit_to_shareholders_year_on_year']>0]
+    b = b[b['inc_revenue_year_on_year']>0]
+    c = c[c['pe_ratio']>0]
+    
+    #从备选股中筛选出增长率大于10%的股票
+    f = (c['pe_ratio']/b['inc_revenue_year_on_year'])
+    h = (c['pe_ratio']/a['inc_net_profit_to_shareholders_year_on_year'])
+    df1 = pd.DataFrame(f, columns = ['peg_re'])
+    df2 = pd.DataFrame(h, columns = ['peg_pro'])
+    df1 = df1.sort(columns = ['peg_re'], ascending = True)
+    df2 = df2.sort(columns = ['peg_pro'], ascending = True)
+    list1 = df1.index
+    list2 = df2.index
+    list3 = [ x for x in list1[:g.number] if x in list2[:g.number] ]
+    g.list4 = filter_st_stock(list3)
+
+# 将资金分成若干等份并买入
+def peg_ex(context):
+    a_f = context.portfolio.available_cash
+    na = len(g.list4)
+    for security in g.list4[:g.ornum]:
+        if security not in g.b_l.keys():
+                order_value(security, a_f/g.ornum)
+        else:
+            pass
+    
+    a_f = context.portfolio.available_cash
+    for security in g.list4:
+        if security not in g.b_l.keys():
+            if security not in context.portfolio.positions.keys():
+                order_value(security, a_f)
+            
+    
+import macro
+import risk_control
 
 
-#黑名单剔除
-def delete_from_blacklist(context):
-    black_list_name = list(g.black_list.keys())
-    for security in black_list_name:
-        g.black_list[security]+= 1
-        if g.black_list[security] > g.lock_up_period:
-            del g.black_list[security]
 
 
+def initialize(context):
+    set_para()
+    set_config(context)
+    get_all_price(context)
 
+def before_market_open(context):
+    timer(context)
+    macro_prediction(context)
+    peg(context)
+    blacklist(context)
 
+def after_market_close(context):
+    pass
+        
+    
 
-
-
+        
+    
 
 
